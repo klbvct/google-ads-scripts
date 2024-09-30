@@ -13,8 +13,8 @@ function main() {
     while (videoCampaigns.hasNext()) {
       var campaign = videoCampaigns.next();
 
-      // Проверяем, активна ли кампания
-      if (campaign.isEnabled()) {
+      // Проверяем, активна ли кампания или на паузе
+      if (campaign.isEnabled() || campaign.isPaused()) {
         // Получаем все группы объявлений для текущей видео-кампании
         var adGroups = campaign.videoAdGroups().get(); // Используем метод videoAdGroups()
 
