@@ -25,7 +25,7 @@ function main() {
               var adGroup = adGroups.next();
   
               // Проверяем, активна ли группа объявлений
-              if (adGroup.isEnabled()) {
+              if (adGroup.isEnabled() || adGroup.isPaused()) {
                 var adGroupName = adGroup.getName();
   
                 // Получаем статистику за текущий месяц для группы объявлений
