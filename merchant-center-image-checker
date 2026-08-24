@@ -1,0 +1,1593 @@
+/************************************************************
+ * MERCHANT CENTER IMAGE CHECKER
+ *
+ *
+ * Перевіряє основне зображення товару:
+ * - < 500 px       -> НЕ ВІДПОВІДАЄ МІНІМУМУ
+ * - 500-1499 px    -> НИЖЧЕ РЕКОМЕНДОВАНОГО
+ * - >= 1500 px     -> ВІДМІННО
+ *
+ * Перевірка виконується пакетами через fetchAll()
+ * для значного прискорення.
+ ************************************************************/
+
+
+// ==========================================================
+// НАЛАШТУВАННЯ
+// ==========================================================
+
+var SPREADSHEET_URL =
+  ''; // ПОСИЛАННЯ НА НОВУ ТАБЛИЦЮ
+
+var MERCHANT_ID = ''; // ІДЕНТИФІКАТОР MERCHANT
+
+var SHEET_NAME = 'Лист1';
+
+
+// Мінімальний розмір Google
+var MIN_SIZE = 500;
+
+// Рекомендований розмір
+var RECOMMENDED_SIZE = 1500;
+
+
+// Скільки URL перевіряємо одночасно
+var BATCH_SIZE = 50;
+
+
+// Перший запит — тільки перші 64 KB
+var FIRST_RANGE_SIZE = 65536;
+
+
+// Якщо розмір не вдалося визначити,
+// повторно запитуємо перший 1 MB
+var SECOND_RANGE_SIZE = 1048576;
+
+
+// ==========================================================
+// ГОЛОВНА ФУНКЦІЯ
+// ==========================================================
+
+function main() {
+
+  Logger.log(
+    'Починаємо перевірку зображень...'
+  );
+
+
+  // --------------------------------------------------------
+  // Google Таблиця
+  // --------------------------------------------------------
+
+  var spreadsheet =
+    SpreadsheetApp.openByUrl(
+      SPREADSHEET_URL
+    );
+
+
+  var sheet =
+    spreadsheet.getSheetByName(
+      SHEET_NAME
+    );
+
+
+  if (!sheet) {
+
+    throw new Error(
+      'Аркуш "Лист1" не знайдено.'
+    );
+  }
+
+
+  // --------------------------------------------------------
+  // Очищаємо Лист1
+  // --------------------------------------------------------
+
+  sheet.clear();
+
+
+  // --------------------------------------------------------
+  // Заголовки
+  // --------------------------------------------------------
+
+  sheet
+    .getRange(
+      1,
+      1,
+      1,
+      7
+    )
+    .setValues([[
+      'ID товару',
+      'Назва',
+      'Тип зображення',
+      'URL зображення',
+      'Ширина',
+      'Висота',
+      'Статус'
+    ]]);
+
+
+  sheet
+    .getRange(
+      1,
+      1,
+      1,
+      7
+    )
+    .setFontWeight('bold');
+
+
+  // --------------------------------------------------------
+  // Отримуємо товари
+  // --------------------------------------------------------
+
+  Logger.log(
+    'Отримуємо товари з Merchant Center...'
+  );
+
+
+  var query =
+    'SELECT ' +
+    'shopping_product.merchant_center_id, ' +
+    'shopping_product.item_id, ' +
+    'shopping_product.title, ' +
+    'shopping_product.product_image_uri ' +
+    'FROM shopping_product ' +
+    'WHERE shopping_product.merchant_center_id = ' +
+    MERCHANT_ID;
+
+
+  var report =
+    AdsApp.report(query);
+
+
+  var iterator =
+    report.rows();
+
+
+  var products = [];
+
+
+  while (
+    iterator.hasNext()
+  ) {
+
+    var row =
+      iterator.next();
+
+
+    var productId =
+      row[
+        'shopping_product.item_id'
+      ] || '';
+
+
+    var title =
+      row[
+        'shopping_product.title'
+      ] || '';
+
+
+    var imageUrl =
+      row[
+        'shopping_product.product_image_uri'
+      ] || '';
+
+
+    if (!imageUrl) {
+      continue;
+    }
+
+
+    products.push({
+
+      productId: productId,
+
+      title: title,
+
+      imageUrl: imageUrl
+
+    });
+  }
+
+
+  Logger.log(
+    'Знайдено товарів із зображеннями: ' +
+    products.length
+  );
+
+
+  if (
+    products.length === 0
+  ) {
+
+    Logger.log(
+      'Товарів для перевірки не знайдено.'
+    );
+
+    return;
+  }
+
+
+  // --------------------------------------------------------
+  // Унікальні URL
+  // --------------------------------------------------------
+  //
+  // Якщо одна картинка використовується
+  // у декількох товарах — перевіряємо її лише один раз.
+  // --------------------------------------------------------
+
+  var uniqueUrls = [];
+
+  var seen = {};
+
+
+  products.forEach(
+    function(product) {
+
+      if (
+        !seen[
+          product.imageUrl
+        ]
+      ) {
+
+        seen[
+          product.imageUrl
+        ] = true;
+
+
+        uniqueUrls.push(
+          product.imageUrl
+        );
+      }
+
+    }
+  );
+
+
+  Logger.log(
+    'Унікальних зображень: ' +
+    uniqueUrls.length
+  );
+
+
+  // --------------------------------------------------------
+  // Перевіряємо зображення ПАРАЛЕЛЬНО
+  // --------------------------------------------------------
+
+  var imageResults =
+    checkImagesInBatches(
+      uniqueUrls
+    );
+
+
+  // --------------------------------------------------------
+  // Формуємо звіт
+  // --------------------------------------------------------
+
+  var output = [];
+
+
+  var failsMinimum = 0;
+
+  var belowRecommended = 0;
+
+  var excellent = 0;
+
+  var errors = 0;
+
+
+  products.forEach(
+    function(product) {
+
+
+      var result =
+        imageResults[
+          product.imageUrl
+        ];
+
+
+      if (!result) {
+
+        result = {
+
+          width: '',
+
+          height: '',
+
+          status:
+            'НЕ ВДАЛОСЯ ПЕРЕВІРИТИ'
+        };
+      }
+
+
+      // Статистика
+      if (
+        result.status ===
+        'НЕ ВІДПОВІДАЄ МІНІМУМУ'
+      ) {
+
+        failsMinimum++;
+
+      }
+
+      else if (
+        result.status ===
+        'НИЖЧЕ РЕКОМЕНДОВАНОГО'
+      ) {
+
+        belowRecommended++;
+
+      }
+
+      else if (
+        result.status ===
+        'ВІДМІННО'
+      ) {
+
+        excellent++;
+
+      }
+
+      else {
+
+        errors++;
+      }
+
+
+      output.push([
+
+        product.productId,
+
+        product.title,
+
+        'Основне',
+
+        product.imageUrl,
+
+        result.width,
+
+        result.height,
+
+        result.status
+
+      ]);
+
+    }
+  );
+
+
+  // --------------------------------------------------------
+  // Записуємо в таблицю
+  // --------------------------------------------------------
+
+  writeOutput(
+    sheet,
+    output
+  );
+
+
+  // --------------------------------------------------------
+  // Форматування
+  // --------------------------------------------------------
+
+  formatSheet(
+    sheet
+  );
+
+
+  // --------------------------------------------------------
+  // ПІДСУМОК
+  // --------------------------------------------------------
+
+  Logger.log(
+    '======================================'
+  );
+
+
+  Logger.log(
+    'ГОТОВО'
+  );
+
+
+  Logger.log(
+    'Перевірено товарів: ' +
+    products.length
+  );
+
+
+  Logger.log(
+    'Унікальних зображень: ' +
+    uniqueUrls.length
+  );
+
+
+  Logger.log(
+    '🔴 Не відповідає мінімуму: ' +
+    failsMinimum
+  );
+
+
+  Logger.log(
+    '🟡 Нижче рекомендованого: ' +
+    belowRecommended
+  );
+
+
+  Logger.log(
+    '🟢 Відмінно: ' +
+    excellent
+  );
+
+
+  Logger.log(
+    '⚫ Не вдалося перевірити: ' +
+    errors
+  );
+
+
+  Logger.log(
+    '======================================'
+  );
+}
+
+
+// ==========================================================
+// ПАКЕТНА ПЕРЕВІРКА ЗОБРАЖЕНЬ
+// ==========================================================
+
+function checkImagesInBatches(
+  urls
+) {
+
+  var results = {};
+
+
+  for (
+    var start = 0;
+    start < urls.length;
+    start += BATCH_SIZE
+  ) {
+
+
+    var end =
+      Math.min(
+        start + BATCH_SIZE,
+        urls.length
+      );
+
+
+    var batch =
+      urls.slice(
+        start,
+        end
+      );
+
+
+    Logger.log(
+      'Перевіряємо зображення ' +
+      (start + 1) +
+      '–' +
+      end +
+      ' з ' +
+      urls.length
+    );
+
+
+    // ------------------------------------------------------
+    // Формуємо HTTP-запити
+    // ------------------------------------------------------
+
+    var requests = [];
+
+
+    batch.forEach(
+      function(url) {
+
+        requests.push({
+
+          url: url,
+
+          method: 'get',
+
+          followRedirects: true,
+
+          muteHttpExceptions: true,
+
+          headers: {
+
+            'Range':
+              'bytes=0-' +
+              (FIRST_RANGE_SIZE - 1),
+
+            'User-Agent':
+              'Mozilla/5.0 ' +
+              '(compatible; Merchant Image Checker)'
+
+          }
+
+        });
+
+      }
+    );
+
+
+    var responses;
+
+
+    try {
+
+      responses =
+        UrlFetchApp.fetchAll(
+          requests
+        );
+
+    } catch (e) {
+
+      Logger.log(
+        'Помилка batch: ' +
+        e
+      );
+
+
+      batch.forEach(
+        function(url) {
+
+          results[url] = {
+
+            width: '',
+
+            height: '',
+
+            status:
+              'НЕ ВДАЛОСЯ ПЕРЕВІРИТИ'
+          };
+
+        }
+      );
+
+
+      continue;
+    }
+
+
+    // ------------------------------------------------------
+    // Обробляємо відповіді
+    // ------------------------------------------------------
+
+    var needSecondRequest = [];
+
+    var firstResults = [];
+
+
+    for (
+      var i = 0;
+      i < responses.length;
+      i++
+    ) {
+
+
+      var response =
+        responses[i];
+
+
+      var url =
+        batch[i];
+
+
+      var result =
+        parseImageResponse(
+          response
+        );
+
+
+      firstResults.push({
+        url: url,
+        result: result
+      });
+
+
+      // Якщо розмір не визначився —
+      // додаємо в повторну перевірку.
+      if (
+        result.status ===
+        'RETRY'
+      ) {
+
+        needSecondRequest.push(
+          url
+        );
+
+      } else {
+
+        results[url] =
+          result;
+      }
+
+    }
+
+
+    // ------------------------------------------------------
+    // Повторний запит тільки для проблемних
+    // ------------------------------------------------------
+
+    if (
+      needSecondRequest.length > 0
+    ) {
+
+
+      Logger.log(
+        'Повторна перевірка: ' +
+        needSecondRequest.length
+      );
+
+
+      var retryRequests = [];
+
+
+      needSecondRequest.forEach(
+        function(url) {
+
+          retryRequests.push({
+
+            url: url,
+
+            method: 'get',
+
+            followRedirects: true,
+
+            muteHttpExceptions: true,
+
+            headers: {
+
+              'Range':
+                'bytes=0-' +
+                (SECOND_RANGE_SIZE - 1),
+
+              'User-Agent':
+                'Mozilla/5.0 ' +
+                '(compatible; Merchant Image Checker)'
+
+            }
+
+          });
+
+        }
+      );
+
+
+      var retryResponses;
+
+
+      try {
+
+        retryResponses =
+          UrlFetchApp.fetchAll(
+            retryRequests
+          );
+
+
+        for (
+          var j = 0;
+          j < retryResponses.length;
+          j++
+        ) {
+
+
+          var retryUrl =
+            needSecondRequest[j];
+
+
+          var retryResult =
+            parseImageResponse(
+              retryResponses[j]
+            );
+
+
+          if (
+            retryResult.status ===
+            'RETRY'
+          ) {
+
+            results[retryUrl] = {
+
+              width: '',
+
+              height: '',
+
+              status:
+                'НЕ ВДАЛОСЯ ПЕРЕВІРИТИ'
+            };
+
+          } else {
+
+            results[retryUrl] =
+              retryResult;
+          }
+
+        }
+
+
+      } catch (e) {
+
+
+        needSecondRequest.forEach(
+          function(url) {
+
+            results[url] = {
+
+              width: '',
+
+              height: '',
+
+              status:
+                'НЕ ВДАЛОСЯ ПЕРЕВІРИТИ'
+            };
+
+          }
+        );
+
+      }
+
+    }
+
+  }
+
+
+  return results;
+}
+
+
+// ==========================================================
+// ОБРОБКА HTTP-ВІДПОВІДІ
+// ==========================================================
+
+function parseImageResponse(
+  response
+) {
+
+  try {
+
+    var code =
+      response.getResponseCode();
+
+
+    if (
+      code < 200 ||
+      code >= 400
+    ) {
+
+      return {
+
+        width: '',
+
+        height: '',
+
+        status:
+          'НЕ ВДАЛОСЯ ПЕРЕВІРИТИ'
+      };
+    }
+
+
+    var blob =
+      response.getBlob();
+
+
+    var bytes =
+      blob.getBytes();
+
+
+    var contentType =
+      String(
+        blob.getContentType() || ''
+      ).toLowerCase();
+
+
+    var dimensions =
+      getImageDimensions(
+        bytes,
+        contentType
+      );
+
+
+    if (!dimensions) {
+
+      return {
+
+        width: '',
+
+        height: '',
+
+        status: 'RETRY'
+      };
+    }
+
+
+    var width =
+      dimensions.width;
+
+
+    var height =
+      dimensions.height;
+
+
+    // ------------------------------------------------------
+    // < 500
+    // ------------------------------------------------------
+
+    if (
+      width < MIN_SIZE ||
+      height < MIN_SIZE
+    ) {
+
+      return {
+
+        width: width,
+
+        height: height,
+
+        status:
+          'НЕ ВІДПОВІДАЄ МІНІМУМУ'
+      };
+    }
+
+
+    // ------------------------------------------------------
+    // 500–1499
+    // ------------------------------------------------------
+
+    if (
+      width < RECOMMENDED_SIZE ||
+      height < RECOMMENDED_SIZE
+    ) {
+
+      return {
+
+        width: width,
+
+        height: height,
+
+        status:
+          'НИЖЧЕ РЕКОМЕНДОВАНОГО'
+      };
+    }
+
+
+    // ------------------------------------------------------
+    // >= 1500
+    // ------------------------------------------------------
+
+    return {
+
+      width: width,
+
+      height: height,
+
+      status: 'ВІДМІННО'
+    };
+
+
+  } catch (e) {
+
+    return {
+
+      width: '',
+
+      height: '',
+
+      status:
+        'НЕ ВДАЛОСЯ ПЕРЕВІРИТИ'
+    };
+  }
+}
+
+
+// ==========================================================
+// ВИЗНАЧЕННЯ РОЗМІРІВ
+// ==========================================================
+
+function getImageDimensions(
+  bytes,
+  contentType
+) {
+
+
+  // --------------------------------------------------------
+  // PNG
+  // --------------------------------------------------------
+
+  if (
+    contentType.indexOf('png') !== -1 ||
+    isPNG(bytes)
+  ) {
+
+    if (
+      bytes.length >= 24
+    ) {
+
+      return {
+
+        width:
+          readUInt32BE(
+            bytes,
+            16
+          ),
+
+        height:
+          readUInt32BE(
+            bytes,
+            20
+          )
+      };
+    }
+  }
+
+
+  // --------------------------------------------------------
+  // GIF
+  // --------------------------------------------------------
+
+  if (
+    contentType.indexOf('gif') !== -1 ||
+    isGIF(bytes)
+  ) {
+
+    if (
+      bytes.length >= 10
+    ) {
+
+      return {
+
+        width:
+          (bytes[6] & 255) |
+          ((bytes[7] & 255) << 8),
+
+        height:
+          (bytes[8] & 255) |
+          ((bytes[9] & 255) << 8)
+      };
+    }
+  }
+
+
+  // --------------------------------------------------------
+  // JPEG
+  // --------------------------------------------------------
+
+  if (
+    contentType.indexOf('jpeg') !== -1 ||
+    contentType.indexOf('jpg') !== -1 ||
+    isJPEG(bytes)
+  ) {
+
+    return getJPEGDimensions(
+      bytes
+    );
+  }
+
+
+  // --------------------------------------------------------
+  // WEBP
+  // --------------------------------------------------------
+
+  if (
+    contentType.indexOf('webp') !== -1 ||
+    isWEBP(bytes)
+  ) {
+
+    return getWEBPDimensions(
+      bytes
+    );
+  }
+
+
+  return null;
+}
+
+
+// ==========================================================
+// PNG
+// ==========================================================
+
+function isPNG(bytes) {
+
+  return (
+
+    bytes.length >= 8 &&
+
+    (bytes[0] & 255) === 137 &&
+    (bytes[1] & 255) === 80 &&
+    (bytes[2] & 255) === 78 &&
+    (bytes[3] & 255) === 71 &&
+    (bytes[4] & 255) === 13 &&
+    (bytes[5] & 255) === 10 &&
+    (bytes[6] & 255) === 26 &&
+    (bytes[7] & 255) === 10
+
+  );
+}
+
+
+// ==========================================================
+// GIF
+// ==========================================================
+
+function isGIF(bytes) {
+
+  if (
+    bytes.length < 6
+  ) {
+
+    return false;
+  }
+
+
+  var signature =
+    String.fromCharCode(
+      bytes[0],
+      bytes[1],
+      bytes[2],
+      bytes[3],
+      bytes[4],
+      bytes[5]
+    );
+
+
+  return (
+    signature === 'GIF89a' ||
+    signature === 'GIF87a'
+  );
+}
+
+
+// ==========================================================
+// JPEG
+// ==========================================================
+
+function isJPEG(bytes) {
+
+  return (
+
+    bytes.length >= 2 &&
+
+    (bytes[0] & 255) === 255 &&
+    (bytes[1] & 255) === 216
+
+  );
+}
+
+
+// ==========================================================
+// WEBP
+// ==========================================================
+
+function isWEBP(bytes) {
+
+  if (
+    bytes.length < 12
+  ) {
+
+    return false;
+  }
+
+
+  return (
+
+    String.fromCharCode(
+      bytes[0],
+      bytes[1],
+      bytes[2],
+      bytes[3]
+    ) === 'RIFF'
+
+    &&
+
+    String.fromCharCode(
+      bytes[8],
+      bytes[9],
+      bytes[10],
+      bytes[11]
+    ) === 'WEBP'
+
+  );
+}
+
+
+// ==========================================================
+// PNG UINT32
+// ==========================================================
+
+function readUInt32BE(
+  bytes,
+  offset
+) {
+
+  return (
+
+    ((bytes[offset] & 255) * 16777216) +
+
+    ((bytes[offset + 1] & 255) * 65536) +
+
+    ((bytes[offset + 2] & 255) * 256) +
+
+    (bytes[offset + 3] & 255)
+
+  );
+}
+
+
+// ==========================================================
+// JPEG РОЗМІРИ
+// ==========================================================
+
+function getJPEGDimensions(
+  bytes
+) {
+
+  var offset = 2;
+
+
+  while (
+    offset < bytes.length
+  ) {
+
+
+    // Шукаємо FF
+    while (
+      offset < bytes.length &&
+      (bytes[offset] & 255) !== 255
+    ) {
+
+      offset++;
+    }
+
+
+    // Пропускаємо FF
+    while (
+      offset < bytes.length &&
+      (bytes[offset] & 255) === 255
+    ) {
+
+      offset++;
+    }
+
+
+    if (
+      offset >= bytes.length
+    ) {
+
+      break;
+    }
+
+
+    var marker =
+      bytes[offset] & 255;
+
+
+    offset++;
+
+
+    // Standalone markers
+    if (
+      marker === 1 ||
+      (
+        marker >= 208 &&
+        marker <= 217
+      )
+    ) {
+
+      continue;
+    }
+
+
+    if (
+      offset + 1 >= bytes.length
+    ) {
+
+      break;
+    }
+
+
+    var length =
+      (
+        ((bytes[offset] & 255) << 8) |
+        (bytes[offset + 1] & 255)
+      );
+
+
+    if (
+      length < 2
+    ) {
+
+      return null;
+    }
+
+
+    // SOF markers
+    if (
+
+      marker === 192 ||
+      marker === 193 ||
+      marker === 194 ||
+      marker === 195 ||
+      marker === 197 ||
+      marker === 198 ||
+      marker === 199 ||
+      marker === 201 ||
+      marker === 202 ||
+      marker === 203 ||
+      marker === 205 ||
+      marker === 206 ||
+      marker === 207
+
+    ) {
+
+
+      if (
+        offset + 7 >= bytes.length
+      ) {
+
+        return null;
+      }
+
+
+      var height =
+        (
+          ((bytes[offset + 3] & 255) << 8) |
+          (bytes[offset + 4] & 255)
+        );
+
+
+      var width =
+        (
+          ((bytes[offset + 5] & 255) << 8) |
+          (bytes[offset + 6] & 255)
+        );
+
+
+      return {
+
+        width: width,
+
+        height: height
+      };
+    }
+
+
+    offset += length;
+  }
+
+
+  return null;
+}
+
+
+// ==========================================================
+// WEBP РОЗМІРИ
+// ==========================================================
+
+function getWEBPDimensions(
+  bytes
+) {
+
+  if (
+    bytes.length < 30
+  ) {
+
+    return null;
+  }
+
+
+  var chunk =
+    String.fromCharCode(
+      bytes[12],
+      bytes[13],
+      bytes[14],
+      bytes[15]
+    );
+
+
+  // --------------------------------------------------------
+  // VP8
+  // --------------------------------------------------------
+
+  if (
+    chunk === 'VP8 '
+  ) {
+
+    for (
+      var i = 20;
+      i < bytes.length - 9;
+      i++
+    ) {
+
+      if (
+
+        (bytes[i] & 255) === 157 &&
+        (bytes[i + 1] & 255) === 1 &&
+        (bytes[i + 2] & 255) === 42
+
+      ) {
+
+
+        var width =
+          (
+            (bytes[i + 3] & 255) |
+            ((bytes[i + 4] & 255) << 8)
+          ) & 16383;
+
+
+        var height =
+          (
+            (bytes[i + 5] & 255) |
+            ((bytes[i + 6] & 255) << 8)
+          ) & 16383;
+
+
+        return {
+
+          width: width,
+
+          height: height
+        };
+      }
+    }
+  }
+
+
+  // --------------------------------------------------------
+  // VP8X
+  // --------------------------------------------------------
+
+  if (
+    chunk === 'VP8X'
+  ) {
+
+    return {
+
+      width:
+        1 +
+        (bytes[24] & 255) +
+        ((bytes[25] & 255) << 8) +
+        ((bytes[26] & 255) << 16),
+
+      height:
+        1 +
+        (bytes[27] & 255) +
+        ((bytes[28] & 255) << 8) +
+        ((bytes[29] & 255) << 16)
+
+    };
+  }
+
+
+  return null;
+}
+
+
+// ==========================================================
+// ЗАПИС У GOOGLE SHEETS
+// ==========================================================
+
+function writeOutput(
+  sheet,
+  rows
+) {
+
+  if (
+    rows.length === 0
+  ) {
+
+    return;
+  }
+
+
+  var WRITE_BATCH = 500;
+
+
+  for (
+    var start = 0;
+    start < rows.length;
+    start += WRITE_BATCH
+  ) {
+
+
+    var batch =
+      rows.slice(
+        start,
+        Math.min(
+          start + WRITE_BATCH,
+          rows.length
+        )
+      );
+
+
+    sheet
+      .getRange(
+        start + 2,
+        1,
+        batch.length,
+        7
+      )
+      .setValues(
+        batch
+      );
+  }
+}
+
+
+// ==========================================================
+// ФОРМАТУВАННЯ
+// ==========================================================
+
+function formatSheet(
+  sheet
+) {
+
+  var lastRow =
+    sheet.getLastRow();
+
+
+  if (
+    lastRow < 2
+  ) {
+
+    return;
+  }
+
+
+  // Закріпити заголовок
+  sheet.setFrozenRows(1);
+
+
+  // Ширини колонок
+  sheet.setColumnWidth(
+    1,
+    220
+  );
+
+
+  sheet.setColumnWidth(
+    2,
+    300
+  );
+
+
+  sheet.setColumnWidth(
+    3,
+    140
+  );
+
+
+  sheet.setColumnWidth(
+    4,
+    550
+  );
+
+
+  sheet.setColumnWidth(
+    5,
+    90
+  );
+
+
+  sheet.setColumnWidth(
+    6,
+    90
+  );
+
+
+  sheet.setColumnWidth(
+    7,
+    260
+  );
+
+
+  // Фільтр
+  if (
+    sheet.getFilter()
+  ) {
+
+    sheet
+      .getFilter()
+      .remove();
+  }
+
+
+  sheet
+    .getRange(
+      1,
+      1,
+      lastRow,
+      7
+    )
+    .createFilter();
+
+
+  // Розміри по центру
+  sheet
+    .getRange(
+      2,
+      5,
+      lastRow - 1,
+      2
+    )
+    .setHorizontalAlignment(
+      'center'
+    );
+
+
+  // --------------------------------------------------------
+  // Кольори статусів
+  // --------------------------------------------------------
+
+  var statuses =
+    sheet
+      .getRange(
+        2,
+        7,
+        lastRow - 1,
+        1
+      )
+      .getValues();
+
+
+  for (
+    var i = 0;
+    i < statuses.length;
+    i++
+  ) {
+
+
+    var status =
+      String(
+        statuses[i][0]
+      );
+
+
+    var cell =
+      sheet.getRange(
+        i + 2,
+        7
+      );
+
+
+    if (
+      status ===
+      'НЕ ВІДПОВІДАЄ МІНІМУМУ'
+    ) {
+
+      cell.setBackground(
+        '#f4cccc'
+      );
+
+
+    } else if (
+      status ===
+      'НИЖЧЕ РЕКОМЕНДОВАНОГО'
+    ) {
+
+      cell.setBackground(
+        '#fff2cc'
+      );
+
+
+    } else if (
+      status ===
+      'ВІДМІННО'
+    ) {
+
+      cell.setBackground(
+        '#d9ead3'
+      );
+
+
+    } else {
+
+      cell.setBackground(
+        '#d9d9d9'
+      );
+    }
+  }
+}
